@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ASLAY Control Hub - GPU Tuner
-NVIDIA GPU overclocking/underclocking via NVAPI (nvapi.dll) with NVML
+NVIDIA GPU overclocking/underclocking via NVAPI (nvapi64.dll) with NVML
 (pynvml) telemetry. Detection works via NVML; tuning requires the official
 NVIDIA driver to be installed.
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 try:
     import pynvml
@@ -53,7 +53,10 @@ class GPUTuner:
         self._nvapi = None
         self._initialized = False
         self._nvml_initialized = False
+        # Resolved NVAPI function pointers (resolved once at start)
+        self._fn_set_pstates = None
 
+    # ── lifecycle ────────────────────────────────────────────────
     def start(self) -> bool:
         try:
             self._nvapi = ctypes.WinDLL("nvapi64")
@@ -65,9 +68,9 @@ class GPUTuner:
                 self._nvapi = None
         if self._nvapi is not None:
             try:
-                query = self._nvapi.nvapi_QueryInterface
-                query.restype = ctypes.c_void_p
-                init_addr = query(0x0154E58D)
+                qi = self._nvapi.nvapi_QueryInterface
+                qi.restype = ctypes.c_void_p
+                init_addr = qi(0x0154E58D)          # NvAPI_Initialize
                 if init_addr:
                     init = ctypes.CFUNCTYPE(ctypes.c_int)(init_addr)
                     status = init()
@@ -95,23 +98,19 @@ class GPUTuner:
                 pass
         self._initialized = False
         self._nvml_initialized = False
+        self._fn_set_pstates = None
 
-    def _query_interface(self, ordinal: int):
-        qi = self._nvapi.nvapi_QueryInterface
-        qi.restype = ctypes.c_void_p
-        return qi(ordinal)
-
-    def _nvapi_call(self, ordinal: int, restype, argtypes, *args):
+    # ── helpers ──────────────────────────────────────────────────
+    def _resolve(self, ordinal: int):
         if not self._initialized:
             return None
-        addr = self._query_interface(ordinal)
-        if not addr:
-            return None
-        fn = ctypes.CFUNCTYPE(restype, *argtypes)(addr)
-        return fn(*args)
+        qi = self._nvapi.nvapi_QueryInterface
+        qi.restype = ctypes.c_void_p
+        addr = qi(ordinal)
+        return addr
 
+    # ── detection (NVML) ─────────────────────────────────────────
     def detect_physical_gpus(self) -> List[dict]:
-        """List physical NVIDIA GPUs via NVML (requires driver)."""
         if not self._nvml_initialized:
             return []
         gpus = []
@@ -121,8 +120,11 @@ class GPUTuner:
             name = pynvml.nvmlDeviceGetName(h)
             if isinstance(name, bytes):
                 name = name.decode("utf-8", "ignore")
-            pci = pynvml.nvmlDeviceGetPciInfo(h)
-            pci_id = getattr(pci, "pciDeviceId", "")
+            try:
+                pci = pynvml.nvmlDeviceGetPciInfo(h)
+                pci_id = getattr(pci, "pciDeviceId", "")
+            except Exception:
+                pci_id = ""
             gpus.append({
                 "index": i,
                 "name": name,
@@ -133,7 +135,6 @@ class GPUTuner:
         return gpus
 
     def list_devices(self) -> List[GPUDevice]:
-        """Build GPUDevice list with live telemetry and detected limits."""
         devices: List[GPUDevice] = []
         if not self._nvml_initialized:
             return devices
@@ -154,7 +155,7 @@ class GPUTuner:
             core = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)
             memclk = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_MEM)
             core_limit, mem_limit = self._query_offset_limits(i)
-            dev = GPUDevice(
+            devices.append(GPUDevice(
                 index=i, name=name,
                 pci_device_id="", vram_mb=mem.total // (1024 * 1024),
                 driver_version=str(pynvml.nvmlSystemGetDriverVersion()),
@@ -162,52 +163,85 @@ class GPUTuner:
                 temperature_c=temp, utilization_percent=util.gpu,
                 power_current_mw=power_mw, power_min_mw=pmin, power_max_mw=pmax,
                 core_offset_limit_mhz=core_limit, memory_offset_limit_mhz=mem_limit,
-            )
-            devices.append(dev)
+            ))
         return devices
 
     def _query_offset_limits(self, index: int) -> tuple:
         """Conservative safe offset bounds (MHz) used for clamping."""
         return (300, 800)
 
+    # ── tuning (NVAPI) ──────────────────────────────────────────
     def set_core_offset(self, gpu: GPUDevice, offset_mhz: int) -> bool:
-        """Apply core clock offset (clamped to detected safe range)."""
-        if not self._initialized:
-            self._log("[GPU] NVAPI unavailable - core offset not applied.")
-            return False
-        limit = gpu.core_offset_limit_mhz or 300
-        clamped = max(-limit, min(limit, offset_mhz))
-        status = self._nvapi_call(
-            0x0D3F1D5B, ctypes.c_int,
-            [ctypes.c_uint, ctypes.POINTER(ctypes.c_int)],
-            gpu.index, ctypes.byref(ctypes.c_int(clamped)),
-        )
-        if status == 0:
-            self._log("[GPU] Core offset set to %+d MHz (clamped within %d)" % (clamped, limit))
-            return True
-        self._log("[GPU] Core offset command rejected (status=%s)" % status)
-        return False
+        """
+        Apply a core clock offset. Uses NVAPI LKGV (clock offset) which is
+        per-domain: 0 = graphics core, 1 = memory. Clamped to safe range.
+        Requires Administrator.
+        """
+        return self._set_clock_offset(gpu.index, domain=0, offset_mhz=offset_mhz,
+                                      limit=gpu.core_offset_limit_mhz or 300,
+                                      label="Core")
 
     def set_memory_offset(self, gpu: GPUDevice, offset_mhz: int) -> bool:
-        """Apply memory clock offset (clamped to detected safe range)."""
+        """Apply a memory clock offset (domain 1), clamped to safe range."""
+        return self._set_clock_offset(gpu.index, domain=1, offset_mhz=offset_mhz,
+                                      limit=gpu.memory_offset_limit_mhz or 800,
+                                      label="Memory")
+
+    def _set_clock_offset(self, index: int, domain: int, offset_mhz: int,
+                          limit: int, label: str) -> bool:
         if not self._initialized:
-            self._log("[GPU] NVAPI unavailable - memory offset not applied.")
+            self._log("[GPU] NVAPI unavailable - %s offset not applied." % label)
             return False
-        limit = gpu.memory_offset_limit_mhz or 800
         clamped = max(-limit, min(limit, offset_mhz))
-        status = self._nvapi_call(
-            0x0D3F1D5B, ctypes.c_int,
-            [ctypes.c_uint, ctypes.POINTER(ctypes.c_int)],
-            gpu.index, ctypes.byref(ctypes.c_int(clamped)),
-        )
+        # NvAPI_GPU_SetClientClockOffset is ordinal 0x0F7462BE:
+        # (NvPhysicalGpuHandle gpu, void* reserved, int domain, int offsetKHz)
+        addr = self._resolve(0x0F7462BE)
+        if not addr:
+            self._log("[GPU] NVAPI clock-offset function not exported by this driver.")
+            return False
+        fn = ctypes.CFUNCTYPE(
+            ctypes.c_int,                       # status
+            ctypes.c_void_p,                    # NvPhysicalGpuHandle
+            ctypes.c_void_p,                    # reserved
+            ctypes.c_int,                       # clock domain
+            ctypes.c_int,                       # offset kHz
+        )(addr)
+        handle = self._nvml_gpu_handle(index)
+        if handle is None:
+            self._log("[GPU] Cannot resolve physical GPU handle for index %d." % index)
+            return False
+        status = fn(handle, None, domain, clamped * 1000)
         if status == 0:
-            self._log("[GPU] Memory offset set to %+d MHz (clamped within %d)" % (clamped, limit))
+            self._log("[GPU] %s offset set to %+d MHz (clamped within %d)"
+                      % (label, clamped, limit))
             return True
-        self._log("[GPU] Memory offset command rejected (status=%s)" % status)
+        self._log("[GPU] %s offset rejected (status=%d) - driver may lock this." % (label, status))
         return False
 
+    def _nvml_gpu_handle(self, index: int):
+        """NVML handles are distinct from NVAPI physical GPU handles, so we
+        enumerate NVAPI physical GPUs and map index -> handle by order."""
+        if not self._initialized:
+            return None
+        # NvAPI_EnumPhysicalGPUs ordinal 0xE5AC921F:
+        # (NvPhysicalGpuHandle* handles, int* count)
+        addr = self._resolve(0xE5AC921F)
+        if not addr:
+            return None
+        fn = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_int),
+        )(addr)
+        handles = (ctypes.c_void_p * 64)()
+        count = ctypes.c_int(0)
+        status = fn(handles, ctypes.byref(count))
+        if status != 0 or count.value <= index:
+            return None
+        return handles[index]
+
     def set_power_limit(self, gpu: GPUDevice, watts: float) -> bool:
-        """Set TGP power limit in watts within driver constraints."""
+        """Set TGP power limit in watts within driver constraints (NVML)."""
         if not self._nvml_initialized:
             self._log("[GPU] NVML unavailable - power limit not applied.")
             return False
@@ -225,15 +259,14 @@ class GPUTuner:
             self._log("[GPU] Power limit set failed: %s" % exc)
             return False
 
+    # ── presets ─────────────────────────────────────────────────
     def enable_game_boost(self, gpu: GPUDevice) -> bool:
-        """Boost mode: max power limit + moderate core/memory offsets."""
         ok1 = self.set_power_limit(gpu, gpu.power_max_w) if gpu.power_max_mw else False
         ok2 = self.set_core_offset(gpu, 90)
         ok3 = self.set_memory_offset(gpu, 400)
         return ok1 or ok2 or ok3
 
     def reset_offsets(self, gpu: GPUDevice) -> bool:
-        """Reset core and memory offsets to factory default (0 MHz)."""
         ok1 = self.set_core_offset(gpu, 0)
         ok2 = self.set_memory_offset(gpu, 0)
         return ok1 and ok2
