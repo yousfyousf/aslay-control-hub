@@ -1,0 +1,16 @@
+name: Build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --noconfirm --onefile --windowed --name ASLAY_Control_Hub --manifest app.manifest main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ASLAY_Control_Hub_windows
+          path: dist/ASLAY_Control_Hub.exe
