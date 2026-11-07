@@ -10,7 +10,7 @@ Run:  python -m src.ui.main_window   (requires Administrator for full features)
 from __future__ import annotations
 
 import sys
-from typing import Callable, Optional
+from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
@@ -31,6 +31,8 @@ DARK_BG = "#12161c"
 DARK_PANEL = "#1a2029"
 DARK_TEXT = "#e6e9ee"
 ACCENT = "#3fc1ff"
+
+PAGE_NAMES = ["GPU", "Battery", "RGB", "Storage", "Wi-Fi", "Drivers", "BIOS", "Processes"]
 
 
 class Page(QWidget):
@@ -80,15 +82,16 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(200, self._init_backends)
 
     # ── log routing (backends log before pages exist) ────────────
-    def _page_log(self, page: str, message: str) -> None:
+    def _page_log(self, page_name: str, message: str) -> None:
         if hasattr(self, "pages"):
-            widget = self.pages.widget(self._page_index(page))
+            widget = self._page(page_name)
             if widget:
                 widget.log(message)
 
-    def _page_index(self, name: str) -> int:
-        names = ["GPU", "Battery", "RGB", "Storage", "Wi-Fi", "Drivers", "BIOS", "Processes"]
-        return names.index(name) if name in names else 0
+    def _page(self, name: str) -> Optional[Page]:
+        if not hasattr(self, "pages") or name not in PAGE_NAMES:
+            return None
+        return self.pages.widget(PAGE_NAMES.index(name))
 
     # ── UI construction ─────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -99,7 +102,7 @@ class MainWindow(QMainWindow):
         sidebar.setContentsMargins(8, 8, 8, 8)
         self.pages = QStackedWidget()
 
-        # GPU page with buttons
+        # GPU page
         gpu_page = Page("GPU Tuner")
         gpu_boost_btn = QPushButton("Enable Game Boost (max TGP + safe offsets)")
         gpu_boost_btn.clicked.connect(self._gpu_boost)
@@ -121,11 +124,11 @@ class MainWindow(QMainWindow):
         battery_refresh.clicked.connect(self._battery_refresh)
         battery_page.layout().insertWidget(5, battery_refresh)
 
-        # RGB page
+        # RGB page (keep a direct reference to the combo)
         rgb_page = Page("RGB Keyboard")
-        rgb_combo = QComboBox()
-        rgb_combo.addItems(["Rainbow", "Static (custom color)", "Breathing", "Wave", "Off"])
-        rgb_page.layout().insertWidget(2, rgb_combo)
+        self.rgb_combo = QComboBox()
+        self.rgb_combo.addItems(["Rainbow", "Static (custom color)", "Breathing", "Wave", "Off"])
+        rgb_page.layout().insertWidget(2, self.rgb_combo)
         rgb_btn = QPushButton("Apply lighting")
         rgb_btn.clicked.connect(self._rgb_apply)
         rgb_page.layout().insertWidget(3, rgb_btn)
@@ -239,16 +242,14 @@ class MainWindow(QMainWindow):
         self.gpu_tuner.start()
         self.ec.start()
         gpus = self.gpu_tuner.detect_physical_gpus()
+        gpu_page = self._page("GPU")
         if gpus:
-            self._page("GPU").info.setText("GPU: %s (%d MB VRAM, driver %s)"
-                                            % (gpus[0]["name"], gpus[0]["vram_mb"],
-                                               gpus[0]["driver_version"]))
+            gpu_page.info.setText("GPU: %s (%d MB VRAM, driver %s)"
+                                  % (gpus[0]["name"], gpus[0]["vram_mb"],
+                                     gpus[0]["driver_version"]))
         else:
-            self._page("GPU").info.setText("No NVIDIA GPU via NVML (driver missing or AMD machine).")
+            gpu_page.info.setText("No NVIDIA GPU via NVML (driver missing or AMD machine).")
         self._battery_refresh()
-
-    def _page(self, name: str) -> Page:
-        return self.pages.widget(self._page_index(name))
 
     # ── actions ──────────────────────────────────────────────────
     def _gpu_boost(self) -> None:
@@ -280,7 +281,7 @@ class MainWindow(QMainWindow):
             page.info.setText("Could not apply limit (need Administrator + WinRing0x64.dll).")
 
     def _battery_refresh(self) -> None:
-        page = self._page("Battery") if hasattr(self, "pages") else None
+        page = self._page("Battery")
         if page is None:
             return
         st = self.ec.read_limits_status()
@@ -289,9 +290,11 @@ class MainWindow(QMainWindow):
                 "Design: %d mWh | Full: %d mWh | Cycles: %d | EC write: %s (%s)"
                 % (st.design_capacity_mwh, st.full_charge_mwh, st.cycle_count,
                    "available" if st.ec_writable else "unavailable", st.source))
+        else:
+            page.info.setText("No battery detected (desktop machine?).")
 
     def _rgb_apply(self) -> None:
-        from src.hardware.rgb_hid import RGBHIDController, RGBProfile, MODE_CODES
+        from src.hardware.rgb_hid import RGBHIDController, RGBProfile
         page = self._page("RGB")
         mode_key = {
             "Rainbow": "rainbow",
@@ -299,7 +302,7 @@ class MainWindow(QMainWindow):
             "Breathing": "breathing",
             "Wave": "wave",
             "Off": "off",
-        }[self.sender().parent().findChild(QComboBox).currentText()]
+        }[self.rgb_combo.currentText()]
         controller = RGBHIDController(emit_log=page.log)
         if controller.detect():
             ok = controller.apply_profile(RGBProfile(mode=mode_key))
@@ -318,11 +321,10 @@ class MainWindow(QMainWindow):
             return
         lines = []
         for d in disks:
-            line = "%s - %s - %.1f GB - Temp: %s C - S.M.A.R.T: %s" % (
+            lines.append("%s - %s - %.1f GB - Temp: %s C - S.M.A.R.T: %s" % (
                 d.model, d.media_type, d.size_gb,
                 d.temperature_c if d.temperature_c is not None else "n/a",
-                "OK" if d.smart_status_ok else "PROBLEM")
-            lines.append(line)
+                "OK" if d.smart_status_ok else "PROBLEM"))
             for w in d.warnings:
                 lines.append("  ! " + w)
         page.info.setText("\n".join(lines))
