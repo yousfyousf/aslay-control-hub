@@ -80,8 +80,8 @@ class RGBHIDController:
         self._hid = ctypes.WinDLL("hid.dll")
         self._setup = ctypes.WinDLL("setupapi")
 
-    # ── HID GUID (queried from hid.dll, never hardcoded bytes) ──
-    def _hid_guid(self) -> ctypes.c_char * 16:
+    # ── HID GUID (queried from hid.dll, never hardcoded) ────────
+    def _hid_guid(self):
         buf = (ctypes.c_char * 16)()
         self._hid.HidD_GetHidGuid(ctypes.byref(buf))
         return buf
@@ -123,17 +123,16 @@ class RGBHIDController:
                     index += 1
                     continue
                 buf = ctypes.create_string_buffer(required.value)
-                # SP_DEVICE_INTERFACE_DETAIL_DATA_W: cbSize then null-terminated path
-                # cbSize is 8 on x64 (4 header + 4 padding), 6 on x86.
                 ctypes.memset(buf, 0, required.value)
-                struct.pack_into("I", buf, 0,
-                                 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6)
+                # SP_DEVICE_INTERFACE_DETAIL_DATA_W.cbSize:
+                # 8 on x64, 6 on x86 (documented Windows ABI)
+                cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+                buf[0:4] = cb_size.to_bytes(4, "little")
                 if self._setup.SetupDiGetDeviceInterfaceDetailW(
                         handle, ctypes.byref(data), buf, required.value,
                         None, None):
-                    raw = buf.raw
-                    # Path starts right after the cbSize field (offset 4)
-                    wide = raw[4:].split(b"\x00\x00")[0]
+                    # DevicePath begins right after the cbSize DWORD
+                    wide = buf.raw[4:].split(b"\x00\x00")[0]
                     try:
                         path = wide.decode("utf-16-le", errors="ignore")
                         if path:
@@ -201,6 +200,7 @@ class RGBHIDController:
             if handle is None:
                 self._log("[RGB] Open failed (run as Administrator) - skip.")
                 continue
+            verified_here = False
             try:
                 for rid in CANDIDATE_REPORT_IDS:
                     query = bytes([0xA1]) + bytes(62)
@@ -212,11 +212,13 @@ class RGBHIDController:
                         self._report_id = rid
                         self._handle = handle
                         self._verified = True
+                        verified_here = True
                         self._log("[RGB] Verified controller: %s (report 0x%02X)"
                                   % (name, rid))
                         return True
-            except Exception:
-                self._kernel32.CloseHandle(wintypes.HANDLE(handle))
+            finally:
+                if not verified_here:
+                    self._kernel32.CloseHandle(wintypes.HANDLE(handle))
         self._log("[RGB] No ITE 8291 / Uniwill RGB controller responded.")
         return False
 
