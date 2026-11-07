@@ -1,6 +1,5 @@
 # ASLAY Control Hub - dependencies (Windows 10/11, Python 3.10/3.11)
 PyQt6>=6.5
-pythonnet>=3.0
 pywin32>=306
 WMI>=1.5.1
 pynvml>=11.5
