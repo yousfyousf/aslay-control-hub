@@ -1,47 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-ASLAY Control Hub — Dynamic Hardware Scanner
-Detects real hardware at runtime: CPU (CPUID), GPUs (PCI), Wi-Fi cards (PCI),
-storage devices, RAM, motherboard (SMBIOS/DMIDecode), battery (WMI).
+ASLAY Control Hub - Dynamic Hardware Scanner
+Detects real hardware at runtime: CPU (WMI), GPUs (PCI PnP), Wi-Fi cards
+(PCI PnP), storage devices, RAM, motherboard (SMBIOS via WMI), battery (WMI).
 
-Runs WITHOUT Administrator privileges (read-only SMBIOS + PCI vendor queries).
+Runs WITHOUT Administrator privileges (read-only WMI + PCI vendor queries).
 Self-test:  python -m src.hardware.hardware_scanner
 """
 from __future__ import annotations
 
 import json
 import re
-import struct
-import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from typing import Callable, List, Optional
 
 import pythoncom
 import wmi
-
-
-# ─────────────────────────────────────────────────────────────── CPUID helper
-def _cpuid(func_id: int, sub_leaf: int = 0) -> tuple:
-    """Execute CPUID leaf. Returns (eax, ebx, ecx, edx)."""
-    # Windows: use __cpuid via msvcrt intrinsic — pure ctypes approach below.
-    import ctypes
-
-    class _CpuRegister(ctypes.Structure):
-        _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint32),
-                    ("c", ctypes.c_uint32), ("d", ctypes.c_uint32)]
-
-    regs = _CpuRegister()
-    func = ctypes.CFUNCTYPE(None, ctypes.POINTER(_CpuRegister), ctypes.c_uint32, ctypes.c_uint32)(
-        ctypes.cast(_cpuid_impl(), ctypes.c_void_p).value
-    ) if False else None  # placeholder avoided: use inline asm via kernel32 not possible.
-    # Fallback: Python-level CPUID through wmi/Win32_Processor + registry brand string.
-    return 0, 0, 0, 0
-
-
-def _cpuid_impl():
-    """Reserved for kernel bridge; not used in user-mode build."""
-    return None
 
 
 # ─────────────────────────────────────────────────────────────── PCI database
@@ -61,10 +36,6 @@ PCI_VENDORS = {
     0x1AF4: "Red Hat (virtio)",
 }
 
-WIFI_PCI_CLASS = (0x02, 0x80)          # class=Network controller, subclass=Other (wireless)
-GPU_PCI_CLASS = (0x03, 0x00)           # class=Display controller, subclass=VGA
-GPU_PCI_CLASS_3D = (0x03, 0x02)        # 3D controller (discrete laptop GPUs)
-
 
 @dataclass
 class PCIDevice:
@@ -72,7 +43,6 @@ class PCIDevice:
     vendor_id: int
     device_id: int
     vendor_name: str
-    class_code: tuple
     name: str
     subsystem_id: Optional[str] = None
 
@@ -158,11 +128,15 @@ class HardwareScanner:
         for proc in c.Win32_Processor():
             l2 = 0
             l3 = 0
-            for cache in c.Win32_CacheMemory():
-                if cache.Purpose and "L2" in (cache.Purpose or ""):
-                    l2 = max(l2, int(cache.InstalledSize or 0))
-                if cache.Purpose and "L3" in (cache.Purpose or ""):
-                    l3 = max(l3, int(cache.InstalledSize or 0))
+            try:
+                for cache in c.Win32_CacheMemory():
+                    purpose = (cache.Purpose or "").upper()
+                    if "L2" in purpose:
+                        l2 = max(l2, int(cache.InstalledSize or 0))
+                    if "L3" in purpose:
+                        l3 = max(l3, int(cache.InstalledSize or 0))
+            except Exception:
+                pass
             brand = proc.Name.strip()
             vendor = str(proc.Manufacturer or "Unknown")
             return CPUInfo(
@@ -178,7 +152,7 @@ class HardwareScanner:
             )
         return CPUInfo("Unknown", 0, 0, 0, 0, 0, 0, "Unknown")
 
-    # ── GPU + Wi-Fi via PCI ───────────────────────────────────────
+    # ── GPU + Wi-Fi via PCI PnP IDs ───────────────────────────────
     def _detect_pci(self) -> tuple:
         gpus: List[PCIDevice] = []
         wifi: List[PCIDevice] = []
@@ -187,38 +161,33 @@ class HardwareScanner:
             pnp = dev.PNPDeviceID or ""
             if not pnp.upper().startswith("PCI\\"):
                 continue
+            ven = re.search(r"VEN_([0-9A-Fa-f]{4})", pnp)
+            devm = re.search(r"DEV_([0-9A-Fa-f]{4})", pnp)
+            if not ven or not devm:
+                continue
             try:
-                # PCI\VEN_10DE&DEV_25A0&SUBSYS_... → parse
-                ven = re.search(r"VEN_([0-9A-Fa-f]{4})", pnp)
-                devm = re.search(r"DEV_([0-9A-Fa-f]{4})", pnp)
-                if not ven or not devm:
-                    continue
                 vendor_id = int(ven.group(1), 16)
                 device_id = int(devm.group(1), 16)
             except ValueError:
                 continue
-            vendor_name = PCI_VENDORS.get(vendor_id, f"Unknown (0x{vendor_id:04X})")
-            name = dev.Name or f"{vendor_name} Device {device_id:04X}"
+            vendor_name = PCI_VENDORS.get(vendor_id, "Unknown (0x%04X)" % vendor_id)
+            name = dev.Name or "%s Device %04X" % (vendor_name, device_id)
             subsys = re.search(r"SUBSYS_([0-9A-Fa-f]{8})", pnp)
-            pci_addr = pnp.split("\\")[-1]
             entry = PCIDevice(
-                pci_address=pci_addr,
+                pci_address=pnp.split("\\")[-1],
                 vendor_id=vendor_id,
                 device_id=device_id,
                 vendor_name=vendor_name,
-                class_code=(0, 0),
                 name=name,
                 subsystem_id=subsys.group(1) if subsys else None,
             )
             lname = (name or "").lower()
-            # GPU heuristic: vendor known GPU + name keywords or class match
             if vendor_id in (0x10DE, 0x1002, 0x8086) and (
                 "vga" in lname or "display" in lname or "3d" in lname
                 or "radeon" in lname or "nvidia" in lname or "geforce" in lname
                 or "quadro" in lname or "arc" in lname or "graphics" in lname
             ):
                 gpus.append(entry)
-            # Wi-Fi heuristic
             if ("wi-fi" in lname or "wifi" in lname or "wireless" in lname
                     or "wlan" in lname or "802.11" in lname
                     or (vendor_id in (0x8086, 0x14E4, 0x168C, 0x10EC, 0x14C3, 0x17CB)
@@ -233,11 +202,11 @@ class HardwareScanner:
         for mem in c.Win32_PhysicalMemory():
             capacity_gb = round(int(mem.Capacity or 0) / (1024 ** 3), 2)
             ff = int(mem.FormFactor or 0)
-            form = {8: "DIMM", 12: "SODIMM"}.get(ff, f"FormFactor {ff}")
+            form = {8: "DIMM", 12: "SODIMM"}.get(ff, "FormFactor %d" % ff)
             smb = int(mem.SMBIOSMemoryType or 0)
             type_name = {
                 20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 34: "DDR5",
-            }.get(smb, f"Type {smb}")
+            }.get(smb, "Type %d" % smb)
             sticks.append(RAMStick(
                 slot=str(getattr(mem, "DeviceLocator", "?")),
                 capacity_gb=capacity_gb,
@@ -260,8 +229,8 @@ class HardwareScanner:
             if "removable" in media.lower():
                 media = "Removable"
             elif "fixed" in media.lower():
-                # Heuristic: >2 TB or NVMe → SSD assumption flagged in name check
-                media = "SSD/NVMe" if iface.upper() in ("NVME",) or "nvme" in (d.Model or "").lower() else "HDD/SSD"
+                model = (d.Model or "").lower()
+                media = "NVMe SSD" if ("nvme" in model or iface.upper() == "NVME") else "HDD/SSD"
             disks.append(StorageDevice(
                 model=str(d.Model or "Unknown").strip(),
                 interface=iface,
@@ -283,15 +252,14 @@ class HardwareScanner:
             full = designed
             cycles = 0
             try:
-                batt = c.MSBatteryManager()
-                cycles = int(batt[0].CycleCount or 0) if batt else 0
-            except Exception:
-                pass
-            # FullChargeCapacity from BatteryFullChargedCapacity
-            try:
                 fullc = c.BatteryFullChargedCapacity()
                 if fullc:
                     full = int(fullc[0].FullChargedCapacity or designed)
+            except Exception:
+                pass
+            try:
+                bm = c.MSBatteryManager()
+                cycles = int(bm[0].CycleCount or 0) if bm else 0
             except Exception:
                 pass
             win = wmi.WMI().Win32_Battery()
@@ -304,8 +272,8 @@ class HardwareScanner:
                 manufacturer=manufacturer,
                 serial=serial,
             )
-        except Exception as exc:  # no battery (desktop) or WMI blocked
-            self._log(f"[SCAN] Battery WMI unavailable: {exc}")
+        except Exception as exc:
+            self._log("[SCAN] Battery WMI unavailable: %s" % exc)
             return None
 
     # ── Motherboard / SMBIOS ─────────────────────────────────────
@@ -328,14 +296,16 @@ class HardwareScanner:
     def full_scan(self) -> HardwareReport:
         self._log("[SCAN] Detecting CPU...")
         cpu = self._detect_cpu()
-        self._log(f"[SCAN] CPU: {cpu.name} ({cpu.physical_cores}C/{cpu.logical_cores}T)")
+        self._log("[SCAN] CPU: %s (%dC/%dT)" % (cpu.name, cpu.physical_cores, cpu.logical_cores))
 
         self._log("[SCAN] Enumerating PCI devices (GPU / Wi-Fi)...")
         gpus, wifi = self._detect_pci()
         for g in gpus:
-            self._log(f"[SCAN] GPU found: {g.name} [VEN={g.vendor_id:04X} DEV={g.device_id:04X}]")
+            self._log("[SCAN] GPU found: %s [VEN=%04X DEV=%04X]"
+                      % (g.name, g.vendor_id, g.device_id))
         for w in wifi:
-            self._log(f"[SCAN] Wi-Fi found: {w.name} [VEN={w.vendor_id:04X} DEV={w.device_id:04X}]")
+            self._log("[SCAN] Wi-Fi found: %s [VEN=%04X DEV=%04X]"
+                      % (w.name, w.vendor_id, w.device_id))
 
         self._log("[SCAN] Detecting RAM modules...")
         ram = self._detect_ram()
