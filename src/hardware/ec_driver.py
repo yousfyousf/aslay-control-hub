@@ -2,7 +2,7 @@
 """
 ASLAY Control Hub - Embedded Controller (EC) Driver
 Battery charge limiter (60% / 80% / 100%) via raw port I/O on ports 0x62/0x66.
-Uses WinRing0x64.dll (ring-0 bridge) placed next to project root.
+Uses WinRing0x64.dll (ring-0 bridge) placed next to project root or exe.
 Falls back gracefully to WMI read-only mode when ring-0 access is unavailable.
 
 Self-test:  python -m src.hardware.ec_driver   (requires Administrator)
@@ -14,7 +14,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import pythoncom
 import wmi
@@ -32,6 +32,14 @@ EC_CMD_WRITE = 0x81
 BATTERY_LIMIT_OFFSETS = [0xB0, 0xB1, 0xB2, 0xD0, 0xD2, 0xE0, 0xE1, 0xE2, 0xFA, 0xFB]
 
 DLL_NAME = "WinRing0x64.dll"
+
+
+def is_admin() -> bool:
+    """True only when the process token has administrator elevation."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 class WinRing0:
@@ -57,6 +65,9 @@ class WinRing0:
         return None
 
     def initialize(self) -> bool:
+        if not is_admin():
+            self._log("[EC] Administrator elevation required for ring-0 access.")
+            return False
         path = self._find_dll()
         if not path:
             self._log("[EC] WinRing0x64.dll not found next to project root - WMI fallback only.")
@@ -68,8 +79,10 @@ class WinRing0:
             return False
         try:
             self._dll.InitializeOls()
+            # GetDllStatus returns 0 on success, non-zero on failure
             if self._dll.GetDllStatus() != 0:
-                self._log("[EC] WinRing0 InitializeOls failed (driver not loaded).")
+                self._log("[EC] WinRing0 InitializeOls failed (status=%d, driver not loaded)."
+                          % self._dll.GetDllStatus())
                 self._dll = None
                 return False
             self._initialized = True
@@ -142,6 +155,7 @@ class ECDriver:
                 pass
             self._com_ready = False
 
+    # ── raw EC protocol (WinRing0 path) ──────────────────────────
     def _ec_wait_ibf_clear(self, timeout_ms: int = 10) -> bool:
         deadline = time.perf_counter() + timeout_ms / 1000.0
         while time.perf_counter() < deadline:
@@ -187,6 +201,7 @@ class ECDriver:
         self._ring.write_port_byte(EC_DATA_PORT, value & 0xFF)
         return True
 
+    # ── battery status via WMI (always available) ────────────────
     def read_limits_status(self) -> BatteryLimitsStatus:
         try:
             c = wmi.WMI(namespace="root\\WMI")
@@ -246,6 +261,7 @@ class ECDriver:
                 cycle_count=0, ec_writable=self._ring.available,
             )
 
+    # ── charge limiter (WinRing0 path only) ─────────────────────
     def set_charge_limit(self, percent: int) -> bool:
         """Set battery charge ceiling. Valid: 60, 80, 100 (100 = cancel limit)."""
         if percent not in (60, 80, 100):
@@ -260,7 +276,8 @@ class ECDriver:
             if cur is not None and cur in (0, 60, 80, 100):
                 if self._ec_write(off, raw):
                     written_any = True
-                    self._log("[EC] Charge limit %d%% written to EC RAM 0x%02X" % (percent, off))
+                    self._log("[EC] Charge limit %d%% written to EC RAM 0x%02X"
+                              % (percent, off))
         if written_any:
             time.sleep(0.05)
             for off in BATTERY_LIMIT_OFFSETS:
@@ -276,6 +293,7 @@ class ECDriver:
 if __name__ == "__main__":
     print("ASLAY EC Driver self-test")
     print("=" * 40)
+    print("Running as Administrator: %s" % is_admin())
     ec = ECDriver(log=print)
     ring_ok = ec.start()
     print("Ring-0 bridge: %s" % ("ACTIVE" if ring_ok else "NOT ACTIVE (WMI fallback)"))
